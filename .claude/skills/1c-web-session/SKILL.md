@@ -21,6 +21,103 @@ description: >
 
 Использовать `browser_navigate` для перехода по URL. Если сеанс уже запущен — сначала завершить (см. ниже).
 
+## Запуск JS-сценариев по пути
+
+Команда пользователя вида `запусти сценарий <путь-к-файлу>.js` означает: выполнить код этого файла в текущем сеансе 1С через `browser_run_code`.
+
+Формат сценария: JS-выражение функции `async (page) => { ... }` (пример: `.claude/scenarios/*.js`).
+
+Не искать отдельный npm/ps1-раннер как первый шаг. Не запускать файл как обычный Node.js-скрипт.
+
+Алгоритм:
+1. Проверить существование файла сценария по указанному пути.
+2. Запустить или восстановить сеанс 1С (URL из `CLAUDE.md`, обработать лицензию и форму входа по правилам этого скилла).
+3. Выполнить сценарий способом A (по умолчанию). При недоступном clipboard переключиться на способ B.
+
+### Способ A (рекомендуемый по скорости): clipboard loader
+
+Использовать по умолчанию. Это самый быстрый способ для длинных сценариев: в `browser_run_code` передаётся короткий загрузчик, а не весь файл.
+
+1. Скопировать файл сценария в буфер обмена:
+```powershell
+Get-Content -LiteralPath <путь-к-сценарию> -Raw | Set-Clipboard
+```
+2. Проверить доступность clipboard из браузера:
+```javascript
+async (page) => {
+  try {
+    await page.evaluate(() => navigator.clipboard.readText());
+    return { clipboard: 'ok' };
+  } catch (e) {
+    return { clipboard: 'denied', error: String(e) };
+  }
+}
+```
+3. Запустить улучшенный загрузчик сценария (рекомендуется):
+```javascript
+async (page) => {
+  const fail = (stage, e, extra = {}) => {
+    const err = e instanceof Error ? e : new Error(String(e));
+    return {
+      ok: false,
+      stage,
+      name: err.name || 'Error',
+      message: err.message || String(e),
+      stack: err.stack || '',
+      ...extra
+    };
+  };
+
+  let src = '';
+  try {
+    src = await page.evaluate(() => navigator.clipboard.readText());
+  } catch (e) {
+    return fail('clipboard', e);
+  }
+
+  if (!src || !src.includes('async (page)')) {
+    return {
+      ok: false,
+      stage: 'clipboard',
+      message: 'Буфер обмена не содержит сценарий формата async (page) => { ... }'
+    };
+  }
+
+  let scenario;
+  try {
+    scenario = (0, eval)(`(\n${src}\n)\n//# sourceURL=1c-web-scenario.from-clipboard.js`);
+  } catch (e) {
+    return fail('compile', e, { sourcePreview: src.slice(0, 300) });
+  }
+
+  if (typeof scenario !== 'function') {
+    return {
+      ok: false,
+      stage: 'compile',
+      message: 'Сценарий не является функцией',
+      valueType: typeof scenario
+    };
+  }
+
+  try {
+    const result = await scenario(page);
+    return { ok: true, stage: 'runtime', result };
+  } catch (e) {
+    return fail('runtime', e);
+  }
+}
+```
+
+Этот лоадер возвращает структурированную обратную связь: `stage` (`clipboard`/`compile`/`runtime`), `message`, `stack`.
+
+### Способ B (fallback): прямой запуск без clipboard
+
+Использовать, если браузер не дал доступ к clipboard (`NotAllowedError`/`clipboard: denied`).
+
+1. Прочитать файл сценария через shell.
+2. Передать содержимое сценария напрямую в `browser_run_code` и выполнить его как функцию `async (page) => { ... }`.
+3. Если запуск длинного блока падает по лимиту/таймауту — перейти на пошаговое выполнение через `browser_snapshot`, `browser_click`, `browser_press_key`, `browser_type`.
+
 ## Завершение и перезапуск сеанса
 
 **Сервис и настройки** → **Файл** → **Выход** → **Завершить работу**
@@ -270,6 +367,8 @@ await page.goto('<URL базы>');
 ## Оптимизация
 
 **Цель: максимально длинная цепочка в одном `browser_run_code`.** Несколько объектов разных типов, навигация между ними — всё в одном вызове. Чем длиннее цепочка, тем быстрее выполнение.
+
+**Для сценариев из файла (`.claude/scenarios/*.js`) по умолчанию использовать clipboard loader** (см. раздел "Запуск JS-сценариев по пути") — это обычно быстрее, чем передавать весь файл в параметре `browser_run_code`.
 
 **При сбое** (`browser_run_code` упал или вернул ошибку) — не продолжать тот же подход. Переключиться на пошаговые инструменты (`browser_snapshot` → `browser_click` и т.д.), найти причину, затем вернуться к длинной цепочке.
 
